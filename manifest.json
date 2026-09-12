@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.codemonkey76.batch",
+  "name": "Batch",
+  "version": "1.0.0",
+  "author": "Shane Poppleton",
+  "license": "MIT",
+  "description": "Run a script of your own over every file in a folder, one at a time, with progress in the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Batch",
+    "description": "Pick an input folder, an output folder and a script, then run the script over every file in the folder.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 30,
+      "scriptsDir": "",
+      "extensions": "",
+      "fileTimeoutMinutes": 360,
+      "notify": true
+    },
+    "schema": [
+      {
+        "key": "extensions",
+        "type": "string",
+        "label": "Only these extensions",
+        "description": "Space-separated, for example \"mp4 mov mkv\" or \"cr3 nef\". Leave empty to process every file in the folder.",
+        "defaultValue": ""
+      },
+      {
+        "key": "scriptsDir",
+        "type": "path",
+        "label": "Scripts folder",
+        "description": "Where the script dropdown looks. Defaults to ~/.config/omarchy/batch/scripts.",
+        "defaultValue": ""
+      },
+      {
+        "key": "fileTimeoutMinutes",
+        "type": "integer",
+        "label": "Per-file timeout (minutes)",
+        "description": "A single file that takes longer than this is abandoned and counted as failed, and the batch moves on.",
+        "min": 1,
+        "max": 2880,
+        "step": 15,
+        "defaultValue": 360
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "description": "How often the bar checks for a batch it did not start itself. A running batch is polled every second regardless.",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "notify",
+        "type": "boolean",
+        "label": "Notify when a batch finishes",
+        "defaultValue": true
+      }
+    ]
+  }
+}

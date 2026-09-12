@@ -1,0 +1,1065 @@
+#!/usr/bin/python3
+
+# omarchy:summary=Run a script over every file in a folder
+# omarchy:args=<status|config|scripts|scan|set|pick|start|cancel|clear|log>
+# omarchy:group=system
+
+# The panel is a thin renderer; every decision lives here — which files are in
+# scope, what gets skipped, when a half-written output is deleted. A batch runs
+# detached in its own session, so it survives the shell restart that every
+# plugin edit causes, and stays inspectable from a terminal. The shell polls
+# `status` and never touches the files itself.
+#
+# Every reply is a single line of compact JSON, because that is what the widget
+# can read one line at a time under a length ceiling.
+
+import atexit
+import errno
+import json
+import os
+import re
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+# ---------------------------------------------------------------- policy ----
+
+# Nothing here is looked up by name. A widget runs on every login, so a program
+# resolved through PATH is a standing offer to whatever is earliest in it.
+TOOL_DIRS = ("/usr/bin", "/usr/local/bin", "/bin")
+
+# omarchy-file-select is shipped as /usr/share/omarchy/bin/omarchy-file-select,
+# but that is a symlink; the real file is the one that gets verified.
+FILE_SELECT = "/usr/bin/omarchy-file-select"
+
+SELF = os.path.realpath(__file__)
+PYTHON = "/usr/bin/python3"
+
+# The child gets a closed environment: enough to find the session and the
+# system tools it renders with, and nothing else. The fixed PATH matters most —
+# an unattended batch should reach /usr/bin/ffmpeg, not a shim that happened to
+# be ahead of it in the interactive shell that installed the plugin.
+FIXED_PATH = "/usr/local/bin:/usr/bin:/bin"
+ENV_PASSTHROUGH = (
+    "HOME", "USER", "LOGNAME",
+    "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_CONFIG_HOME", "XDG_STATE_HOME",
+    "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY",
+)
+
+# Ceilings. A render loop that decides to narrate every frame must not be able
+# to fill the disk or the widget's parser.
+LOG_CEILING_BYTES = 256 * 1024
+CAPTURE_CEILING_BYTES = 16 * 1024
+READ_CHUNK = 65536
+TEXT_CAP = 240
+
+DEFAULT_FILE_TIMEOUT_SEC = 6 * 3600
+PICK_TIMEOUT_SEC = 620
+KILL_GRACE_SEC = 5.0
+
+# Empty means every file in the folder. A batch is only as specific as the
+# script someone wrote for it, so the default is to hand over everything and
+# let the extension list narrow it when that is what is wanted.
+DEFAULT_EXTENSIONS = ""
+
+# An extension is a short, ordinary token. Anything else in the list is a typo
+# or a paste accident, and silently dropping it beats matching nothing.
+EXTENSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_+-]{0,15}$")
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local/state"),
+    "omarchy-batch",
+)
+CONFIG_FILE = os.path.join(STATE_DIR, "config.json")
+JOB_FILE = os.path.join(STATE_DIR, "job.json")
+LOG_FILE = os.path.join(STATE_DIR, "job.log")
+CANCEL_FLAG = os.path.join(STATE_DIR, "cancel")
+
+DEFAULT_SCRIPTS_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
+    "omarchy/batch/scripts",
+)
+
+
+def tool(name):
+    """An absolute path to a system program, or None. Root-owned, not writable
+    by anyone else, and actually executable — a file that fails any of those is
+    not the program this plugin meant to run."""
+    for directory in TOOL_DIRS:
+        path = os.path.join(directory, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if (stat.S_ISREG(st.st_mode) and st.st_uid == 0
+                and not st.st_mode & 0o022 and st.st_mode & 0o111):
+            return path
+    return None
+
+
+def verified(path):
+    """Same check, for a program named outright rather than searched for."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if (stat.S_ISREG(st.st_mode) and st.st_uid == 0
+            and not st.st_mode & 0o022 and st.st_mode & 0o111):
+        return path
+    return None
+
+
+def child_env(extra=None):
+    env = {"PATH": FIXED_PATH, "LC_ALL": "C.UTF-8"}
+    for key in ENV_PASSTHROUGH:
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    if extra:
+        env.update(extra)
+    return env
+
+
+_CONTROL_CHARS = {code: None for code in list(range(32)) + [127]}
+
+
+def clean(text, cap=TEXT_CAP):
+    """Filenames and script output are outside data. Strip control characters
+    and cap the length before any of it reaches the widget's JSON."""
+    value = str(text).translate(_CONTROL_CHARS)
+    if len(value) > cap:
+        value = value[: cap - 1] + "…"
+    return value
+
+
+# ------------------------------------------------------- state file access --
+
+# The plugin's own files are opened one path component at a time from /, with
+# O_NOFOLLOW at every step, and replaced by rename rather than truncated. A
+# symlink swapped in anywhere along the way makes the open fail instead of
+# writing somewhere else. (The files being processed are handled normally
+# further down: those paths are the user's, and people do legitimately symlink
+# a media or archive folder.)
+
+def _dir_fd(path, create=False):
+    parts = [p for p in os.path.normpath(path).split("/") if p and p != "."]
+    if not parts:
+        raise ValueError("refusing to operate on /")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return fd, parts[-1]
+    except OSError:
+        os.close(fd)
+        raise
+
+
+def read_state_file(path, cap=1024 * 1024):
+    try:
+        fd, name = _dir_fd(path)
+    except OSError:
+        return None
+    try:
+        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        with os.fdopen(handle, "rb") as stream:
+            return stream.read(cap).decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def write_state_file(path, text):
+    fd, name = _dir_fd(path, create=True)
+    tmp = name + ".tmp.%d" % os.getpid()
+    try:
+        try:
+            os.unlink(tmp, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+        handle = os.open(
+            tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd
+        )
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(text.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.rename(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def open_log_append():
+    fd, name = _dir_fd(LOG_FILE, create=True)
+    try:
+        handle = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600, dir_fd=fd
+        )
+    finally:
+        os.close(fd)
+    return os.fdopen(handle, "wb")
+
+
+def truncate_log():
+    write_state_file(LOG_FILE, "")
+
+
+def read_json_file(path):
+    text = read_state_file(path)
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def write_json_file(path, value):
+    write_state_file(path, json.dumps(value, separators=(",", ":")) + "\n")
+
+
+def emit(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def die(message):
+    emit({"ok": False, "error": clean(message)})
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------- config ----
+
+CONFIG_DEFAULTS = {
+    "input": "",
+    "output": "",
+    "script": "",
+    "skipExisting": True,
+    "notify": True,
+    "extensions": DEFAULT_EXTENSIONS,
+    "scriptsDir": "",
+    "fileTimeoutSec": DEFAULT_FILE_TIMEOUT_SEC,
+}
+
+
+def load_config():
+    config = dict(CONFIG_DEFAULTS)
+    stored = read_json_file(CONFIG_FILE)
+    if stored:
+        for key in CONFIG_DEFAULTS:
+            if key in stored and isinstance(stored[key], type(CONFIG_DEFAULTS[key])):
+                config[key] = stored[key]
+    return config
+
+
+def save_config(config):
+    write_json_file(CONFIG_FILE, {k: config[k] for k in CONFIG_DEFAULTS})
+
+
+def scripts_dir(config):
+    return config.get("scriptsDir") or DEFAULT_SCRIPTS_DIR
+
+
+def config_reply(config):
+    return {
+        "ok": True,
+        "input": config["input"],
+        "output": config["output"],
+        "script": config["script"],
+        "scriptName": os.path.basename(config["script"]),
+        "skipExisting": bool(config["skipExisting"]),
+        "notify": bool(config["notify"]),
+        "scriptsDir": scripts_dir(config),
+    }
+
+
+# --------------------------------------------------------------- scripts ----
+
+def list_scripts(config):
+    """Whatever the user has put in the scripts folder. The plugin ships no
+    scripts of its own and creates the folder empty — what belongs in it
+    depends entirely on what the batch is for."""
+    directory = scripts_dir(config)
+    try:
+        os.makedirs(directory, 0o700, exist_ok=True)
+    except OSError:
+        pass
+    entries = []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        names = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            continue
+        entries.append({
+            "path": path,
+            "name": clean(name, 80),
+            "executable": os.access(path, os.X_OK),
+        })
+    return entries
+
+
+# ----------------------------------------------------------- enumeration ----
+
+def extension_set(config):
+    """A set of lowercase suffixes, or empty for "everything"."""
+    raw = config.get("extensions") or ""
+    wanted = set()
+    for token in raw.split():
+        token = token.lstrip(".")
+        if EXTENSION_PATTERN.match(token):
+            wanted.add("." + token.lower())
+    return wanted
+
+
+def list_files(config):
+    """Input-relative paths, sorted, recursing into subfolders. Anything
+    already inside the output folder is excluded, so pointing output at a
+    subfolder of input does not feed the batch its own results on the next
+    run."""
+    root = config["input"]
+    output = os.path.normpath(config["output"]) if config["output"] else None
+    if not root or not os.path.isdir(root):
+        return []
+
+    wanted = extension_set(config)
+    found = []
+    for base, dirs, files in os.walk(root, followlinks=False):
+        if output and os.path.normpath(base) == output:
+            dirs[:] = []
+            continue
+        # Hidden files and folders are skipped whatever the filter says: a
+        # batch over "everything" should not walk into .git or hand a script
+        # someone's .DS_Store.
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(files):
+            if name.startswith("."):
+                continue
+            if wanted and os.path.splitext(name)[1].lower() not in wanted:
+                continue
+            found.append(os.path.relpath(os.path.join(base, name), root))
+    return found
+
+
+def output_path_for(relative, config):
+    """The output mirrors the input's folder structure. A script is free to
+    ignore the name it is handed and write a different extension — but then
+    skip-existing cannot recognise its own earlier output, which the README
+    says out loud."""
+    return os.path.join(config["output"], relative)
+
+
+def should_skip(source, target, config):
+    if not config["skipExisting"]:
+        return False
+    try:
+        out_stat = os.stat(target)
+        in_stat = os.stat(source)
+    except OSError:
+        return False
+    return out_stat.st_size > 0 and out_stat.st_mtime >= in_stat.st_mtime
+
+
+def scan(config):
+    total = 0
+    total_bytes = 0
+    skipped = 0
+    for relative in list_files(config):
+        source = os.path.join(config["input"], relative)
+        total += 1
+        try:
+            total_bytes += os.stat(source).st_size
+        except OSError:
+            pass
+        if should_skip(source, output_path_for(relative, config), config):
+            skipped += 1
+    return {
+        "ok": True,
+        "total": total,
+        "bytes": total_bytes,
+        "skipped": skipped,
+        "pending": total - skipped,
+    }
+
+
+# --------------------------------------------------------------- process ----
+
+_children = set()
+
+
+def _reap_all(*_args):
+    for proc in list(_children):
+        kill_group(proc, grace=1.0)
+    _children.clear()
+
+
+def _signal_exit(signum, _frame):
+    _reap_all()
+    sys.exit(128 + signum)
+
+
+atexit.register(_reap_all)
+for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(_sig, _signal_exit)
+
+
+def kill_group(proc, grace=KILL_GRACE_SEC):
+    """Stopping the immediate child is not enough — it leaves the ffmpeg the
+    script spawned still holding the GPU. Every child gets its own session, so
+    the whole group can be signalled at once."""
+    if proc.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            if pgid is not None:
+                os.killpg(pgid, sig)
+            else:
+                proc.send_signal(sig)
+        except OSError:
+            return
+        deadline = time.time() + (grace if sig == signal.SIGTERM else 1.0)
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.05)
+
+
+def spawn(argv, env, stdout):
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=stdout,
+        stderr=subprocess.STDOUT,
+        env=env,
+        start_new_session=True,
+        close_fds=True,
+    )
+    _children.add(proc)
+    return proc
+
+
+def pump(proc, deadline, sink, ceiling, cancel_check=None):
+    """Read the child's pipe ourselves against a byte ceiling and an absolute
+    deadline. capture_output() would bound neither. Past the ceiling the data
+    is still drained — a child whose pipe fills up simply stops."""
+    written = 0
+    truncated = False
+    fd = proc.stdout.fileno()
+    outcome = "ok"
+
+    while True:
+        if time.time() > deadline:
+            outcome = "timeout"
+            break
+        if cancel_check is not None and cancel_check():
+            outcome = "cancelled"
+            break
+
+        try:
+            ready, _, _ = select.select([fd], [], [], 0.5)
+        except OSError as error:
+            if error.errno == errno.EINTR:
+                continue
+            break
+        if not ready:
+            if proc.poll() is not None:
+                break
+            continue
+
+        try:
+            chunk = os.read(fd, READ_CHUNK)
+        except BlockingIOError:
+            continue
+        except OSError:
+            break
+        if not chunk:
+            break
+
+        if written < ceiling:
+            allowed = chunk[: ceiling - written]
+            sink(allowed)
+            written += len(allowed)
+            dropped = len(chunk) - len(allowed)
+        else:
+            dropped = len(chunk)
+
+        # Said the first time a byte is actually discarded, rather than when a
+        # read happens to straddle the ceiling: 256 KiB is an exact multiple of
+        # the read size, so the common case lands on the boundary and a log
+        # would otherwise be cut short with nothing to say it had been.
+        if dropped and not truncated:
+            sink(b"\n[output truncated at %d bytes]\n" % ceiling)
+            truncated = True
+
+    if outcome != "ok":
+        kill_group(proc)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        kill_group(proc, grace=0.5)
+    _children.discard(proc)
+    return outcome
+
+
+def run_capture(argv, timeout, ceiling=CAPTURE_CEILING_BYTES):
+    """Run a short-lived helper and collect a bounded amount of its output."""
+    collected = bytearray()
+    proc = spawn(argv, child_env(), subprocess.PIPE)
+    outcome = pump(proc, time.time() + timeout, collected.extend, ceiling)
+    return proc.returncode, collected.decode("utf-8", "replace"), outcome
+
+
+# -------------------------------------------------------------- job state ---
+
+def blank_job():
+    return {
+        "state": "idle", "script": "", "scriptName": "", "input": "", "output": "",
+        "current": "", "error": "", "total": 0, "done": 0, "failed": 0, "skipped": 0,
+        "started": 0, "finished": 0, "fileStarted": 0, "pid": 0, "childPid": 0,
+        "failures": [],
+    }
+
+
+def load_job():
+    job = blank_job()
+    stored = read_json_file(JOB_FILE)
+    if stored:
+        for key in job:
+            if key in stored and isinstance(stored[key], type(job[key])):
+                job[key] = stored[key]
+    return job
+
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def current_job():
+    """A worker killed outright (reboot, OOM, SIGKILL) leaves 'running' behind
+    with nothing running. Report that as interrupted rather than spinning a
+    progress bar against a dead pid forever."""
+    job = load_job()
+    if job["state"] == "running" and not alive(job["pid"]):
+        job["state"] = "interrupted"
+        job["current"] = ""
+        job["finished"] = int(time.time())
+        job["pid"] = 0
+        job["childPid"] = 0
+        write_json_file(JOB_FILE, job)
+    job["ok"] = True
+    return job
+
+
+def job_running():
+    job = load_job()
+    return job["state"] == "running" and alive(job["pid"])
+
+
+# ---------------------------------------------------------------- worker ----
+
+def cancelled_by_flag():
+    return os.path.exists(CANCEL_FLAG)
+
+
+def run_worker():
+    config = load_config()
+    job = blank_job()
+    job.update({
+        "state": "running",
+        "script": config["script"],
+        "scriptName": os.path.basename(config["script"]),
+        "input": config["input"],
+        "output": config["output"],
+        "started": int(time.time()),
+        "pid": os.getpid(),
+    })
+
+    relatives = list_files(config)
+    job["total"] = len(relatives)
+    write_json_file(JOB_FILE, job)
+
+    timeout_sec = max(60, int(config.get("fileTimeoutSec") or DEFAULT_FILE_TIMEOUT_SEC))
+    stop = {"cancelled": False}
+
+    def on_term(_signum, _frame):
+        stop["cancelled"] = True
+        _reap_all()
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, on_term)
+
+    log = open_log_append()
+
+    def cancel_check():
+        return stop["cancelled"] or cancelled_by_flag()
+
+    for index, relative in enumerate(relatives, start=1):
+        if cancel_check():
+            stop["cancelled"] = True
+            break
+
+        source = os.path.join(config["input"], relative)
+        target = output_path_for(relative, config)
+
+        if should_skip(source, target, config):
+            job["skipped"] += 1
+            write_json_file(JOB_FILE, job)
+            continue
+
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+        except OSError as error:
+            job["failed"] += 1
+            job["failures"].append(clean("%s (%s)" % (relative, error.strerror)))
+            write_json_file(JOB_FILE, job)
+            continue
+
+        pre_existing = os.path.exists(target)
+        job["current"] = clean(relative)
+        job["fileStarted"] = int(time.time())
+
+        log.write(("\n=== %s\n    %s\n" % (
+            clean(relative, 512), time.strftime("%Y-%m-%d %H:%M:%S"))).encode("utf-8"))
+        log.flush()
+
+        # The script owns the render; we only say where things are. The extra
+        # variables let a script log "3 of 47" without the plugin inventing a
+        # second calling convention.
+        env = child_env({
+            "BATCH_INPUT_DIR": config["input"],
+            "BATCH_OUTPUT_DIR": config["output"],
+            "BATCH_RELATIVE": relative,
+            "BATCH_INDEX": str(index),
+            "BATCH_TOTAL": str(job["total"]),
+        })
+
+        try:
+            proc = spawn([config["script"], source, target], env, subprocess.PIPE)
+        except OSError as error:
+            job["failed"] += 1
+            job["failures"].append(clean("%s (%s)" % (relative, error.strerror)))
+            job["current"] = ""
+            write_json_file(JOB_FILE, job)
+            continue
+
+        job["childPid"] = proc.pid
+        write_json_file(JOB_FILE, job)
+
+        outcome = pump(
+            proc, time.time() + timeout_sec, log.write, LOG_CEILING_BYTES, cancel_check
+        )
+        log.flush()
+        code = proc.returncode
+
+        job["childPid"] = 0
+        job["current"] = ""
+
+        # A cancel kills the render, so its non-zero exit arrives here looking
+        # exactly like a failed encode. The pipe usually reaches EOF before the
+        # cancel flag is next read, so the cancel has to be tested for first or
+        # every cancelled batch reports one phantom failure.
+        if outcome == "cancelled" or stop["cancelled"] or cancelled_by_flag():
+            stop["cancelled"] = True
+            produced = False
+        elif outcome == "timeout":
+            job["failed"] += 1
+            job["failures"].append(clean("%s (timed out)" % relative))
+            log.write(b"    failed: timed out\n")
+            produced = False
+        elif code == 0:
+            job["done"] += 1
+            produced = True
+        else:
+            job["failed"] += 1
+            job["failures"].append(clean("%s (exit %s)" % (relative, code)))
+            log.write(("    failed: exit %s\n" % code).encode("utf-8"))
+            produced = False
+
+        # A killed or crashed render leaves a truncated file behind. Left in
+        # place it is worse than nothing: skip-existing would treat it as
+        # finished on the next run. Only remove what this run created.
+        if not produced and not pre_existing:
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+
+        job["failures"] = job["failures"][-50:]
+        write_json_file(JOB_FILE, job)
+
+        if stop["cancelled"]:
+            break
+
+    log.close()
+    try:
+        os.unlink(CANCEL_FLAG)
+    except OSError:
+        pass
+
+    job["current"] = ""
+    job["pid"] = 0
+    job["childPid"] = 0
+    job["finished"] = int(time.time())
+    if stop["cancelled"]:
+        job["state"] = "cancelled"
+    elif job["failed"]:
+        job["state"] = "finished_with_errors"
+    else:
+        job["state"] = "finished"
+    write_json_file(JOB_FILE, job)
+
+    if config["notify"]:
+        notify(job)
+
+
+def notify(job):
+    program = tool("notify-send")
+    if not program:
+        return
+    summary = {
+        "cancelled": "Batch cancelled",
+        "finished_with_errors": "Batch finished with errors",
+    }.get(job["state"], "Batch finished")
+    parts = ["%d done" % job["done"]]
+    if job["failed"]:
+        parts.append("%d failed" % job["failed"])
+    if job["skipped"]:
+        parts.append("%d skipped" % job["skipped"])
+    try:
+        proc = spawn(
+            [program, "-a", "Batch", summary, " · ".join(parts)],
+            child_env(), subprocess.PIPE,
+        )
+        pump(proc, time.time() + 15, lambda _chunk: None, 4096)
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------- commands ----
+
+def cmd_start():
+    config = load_config()
+
+    if job_running():
+        die("a batch is already running")
+    if not config["input"]:
+        die("choose an input folder first")
+    if not config["output"]:
+        die("choose an output folder first")
+    if not config["script"]:
+        die("choose a script first")
+    if not os.path.isdir(config["input"]):
+        die("input folder is gone: %s" % config["input"])
+    if os.path.normpath(config["input"]) == os.path.normpath(config["output"]):
+        die("input and output folders must differ")
+    if not os.path.isfile(config["script"]):
+        die("script is gone: %s" % os.path.basename(config["script"]))
+    if not os.access(config["script"], os.X_OK):
+        die("script is not executable: chmod +x %s" % config["script"])
+    try:
+        os.makedirs(config["output"], exist_ok=True)
+    except OSError as error:
+        die("cannot create output folder: %s" % error.strerror)
+
+    try:
+        os.unlink(CANCEL_FLAG)
+    except OSError:
+        pass
+    truncate_log()
+
+    # Its own session, so restarting or reloading the shell — which happens on
+    # every plugin edit — cannot take a running render with it.
+    proc = subprocess.Popen(
+        [PYTHON, "-I", SELF, "run-worker"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=child_env(),
+        start_new_session=True,
+        close_fds=True,
+    )
+
+    # Let the worker publish its own state, so the panel's first poll after
+    # Start already shows "running" rather than the previous result.
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if job_running():
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+
+    emit(current_job())
+
+
+def cmd_cancel():
+    job = load_job()
+    try:
+        with open(CANCEL_FLAG, "w"):
+            pass
+    except OSError:
+        pass
+
+    pid = job.get("pid") or 0
+    if alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.time() + KILL_GRACE_SEC
+        while time.time() < deadline and alive(pid):
+            time.sleep(0.05)
+        if alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    # The render is in its own group, so a worker that died before its handler
+    # ran leaves it behind. Signal that group directly as a backstop.
+    child = job.get("childPid") or 0
+    if alive(child):
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(os.getpgid(child), sig)
+            except OSError:
+                break
+            deadline = time.time() + 2.0
+            while time.time() < deadline and alive(child):
+                time.sleep(0.05)
+            if not alive(child):
+                break
+
+    emit(current_job())
+
+
+def apply_setting(config, key, value):
+    """Returns an error string, or None once the value is stored."""
+    if key in ("input", "output", "script"):
+        if not value:
+            return "usage: set %s <path>" % key
+        config[key] = os.path.abspath(os.path.expanduser(value))
+    elif key in ("skipExisting", "notify"):
+        if value not in ("true", "false"):
+            return "usage: set %s <true|false>" % key
+        config[key] = value == "true"
+    elif key == "extensions":
+        config[key] = " ".join(value.split())
+    elif key == "scriptsDir":
+        config[key] = os.path.abspath(os.path.expanduser(value)) if value else ""
+    elif key == "fileTimeoutSec":
+        if not re.fullmatch(r"[0-9]{1,7}", value):
+            return "usage: set fileTimeoutSec <seconds>"
+        config[key] = max(60, int(value))
+    else:
+        return "unknown setting '%s'" % clean(key, 40)
+    return None
+
+
+def cmd_set(argv):
+    if len(argv) < 2:
+        die("usage: set <input|output|script|skipExisting|notify> <value>")
+    config = load_config()
+    error = apply_setting(config, argv[0], argv[1])
+    if error:
+        die(error)
+    save_config(config)
+    emit(config_reply(config))
+
+
+def cmd_configure(argv):
+    """`configure key=value ...` — the widget's settings arrive together, and
+    applying them one subprocess at a time would need a queue on the QML side
+    just to avoid clobbering each other's writes."""
+    config = load_config()
+    for pair in argv:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            die("expected key=value, got '%s'" % clean(pair, 40))
+        error = apply_setting(config, key, value)
+        if error:
+            die(error)
+    save_config(config)
+    emit(config_reply(config))
+
+
+def cmd_open(what):
+    """Open the output folder or the log in whatever the desktop uses. The
+    panel asks for this by name rather than naming a program itself, so every
+    binary this plugin runs is resolved and checked in one place."""
+    config = load_config()
+    if what == "output":
+        target = config["output"]
+        if not target or not os.path.isdir(target):
+            die("no output folder to open")
+    elif what == "log":
+        target = LOG_FILE
+        if not os.path.exists(target):
+            die("no log yet")
+    else:
+        die("usage: open <output|log>")
+
+    program = tool("xdg-open")
+    if not program:
+        die("xdg-open is not installed")
+
+    # Deliberately not registered as a child: this outlives the helper, and the
+    # atexit reaper would otherwise close the window as soon as it opened.
+    try:
+        subprocess.Popen(
+            [program, target],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=child_env(),
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as error:
+        die("could not open: %s" % (error.strerror or error))
+    emit({"ok": True})
+
+
+def cmd_pick(what):
+    titles = {
+        "input": ("Batch: input folder", True),
+        "output": ("Batch: output folder", True),
+        "script": ("Batch: script to run", False),
+    }
+    if what not in titles:
+        die("usage: pick <input|output|script>")
+
+    title, directory = titles[what]
+    program = verified(FILE_SELECT)
+    if not program:
+        die("the desktop file chooser is missing: %s" % FILE_SELECT)
+
+    argv = [program, "--title", title]
+    if directory:
+        argv.append("--directory")
+
+    code, output, outcome = run_capture(argv, PICK_TIMEOUT_SEC)
+    chosen = output.strip().splitlines()
+    if outcome == "timeout":
+        die("the file chooser did not answer")
+    if code == 0 and chosen and chosen[0]:
+        config = load_config()
+        config[what] = chosen[0]
+        save_config(config)
+        emit(config_reply(config))
+        return
+
+    # Nothing picked is a decision, not a fault: reply with what is still set.
+    emit(config_reply(load_config()))
+
+
+def cmd_clear():
+    if job_running():
+        die("a batch is still running")
+    write_json_file(JOB_FILE, blank_job())
+    emit(current_job())
+
+
+USAGE = """Usage: omarchy-batch <command>
+
+  status              Current job as one line of JSON (what the panel polls)
+  config              Saved input/output/script as JSON
+  scripts             Available scripts, as JSON
+  scan                Count and size the files the next run would process
+  set <key> <value>   input|output|script <path>, skipExisting|notify <bool>,
+                      extensions "<ext ext ...>" (empty for every file)
+  configure k=v ...   Apply several settings in one go
+  open <output|log>   Open the output folder, or the log, on the desktop
+  pick <what>         Choose input|output|script with the desktop chooser
+  start               Run the batch detached, one file at a time
+  cancel              Stop the running batch and delete its partial output
+  clear               Reset a finished job back to idle
+  log                 Print the log of the current or last batch
+  log-path            Print where that log lives
+
+Scripts are called once per file with two arguments: input path, output path.
+They run with a fixed PATH (%s) and a closed environment.
+""" % FIXED_PATH
+
+
+def main(argv):
+    command = argv[0] if argv else "status"
+    rest = argv[1:]
+
+    if command in ("-h", "--help", "help"):
+        sys.stdout.write(USAGE)
+        return 0
+
+    if command in ("status", "json"):
+        emit(current_job())
+    elif command == "config":
+        emit(config_reply(load_config()))
+    elif command == "scripts":
+        emit({"ok": True, "scripts": list_scripts(load_config())})
+    elif command == "scan":
+        emit(scan(load_config()))
+    elif command == "set":
+        cmd_set(rest)
+    elif command == "configure":
+        cmd_configure(rest)
+    elif command == "open":
+        cmd_open(rest[0] if rest else "")
+    elif command == "pick":
+        cmd_pick(rest[0] if rest else "")
+    elif command == "start":
+        cmd_start()
+    elif command == "cancel":
+        cmd_cancel()
+    elif command == "clear":
+        cmd_clear()
+    elif command == "log":
+        sys.stdout.write(read_state_file(LOG_FILE) or "")
+    elif command == "log-path":
+        sys.stdout.write(LOG_FILE + "\n")
+    elif command == "scripts-dir":
+        sys.stdout.write(scripts_dir(load_config()) + "\n")
+    elif command == "run-worker":
+        run_worker()
+    else:
+        die("unknown command '%s' (try --help)" % clean(command, 40))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)
+    except OSError as error:
+        die("%s" % (error.strerror or error))
